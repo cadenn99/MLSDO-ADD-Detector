@@ -1,0 +1,137 @@
+name: mlsdo
+services:
+  # --- DATA STORAGE ---
+  mongodb:
+    image: mongo:latest
+    ports:
+      - "27017:27017"
+    volumes:
+      - ./data/raw:/data/raw # Local dataset mounting
+      - ./volumes/mongo_data:/data/db # Database persistence
+    networks:
+      - mlsdo
+
+  # --- ML EXPERIMENT TRACKING (MLflow Stack) ---
+  mlflow:
+    build: ./data/training/mlflow-docker
+    ports:
+      - "5000:5000"
+    environment:
+      MLFLOW_TRACKING_USERNAME: mlflowuser
+      MLFLOW_TRACKING_PASSWORD: ${MLFLOW_PASS}
+      MLFLOW_SERVER_ALLOWED_HOSTS: "*:5000"
+      MLFLOW_S3_ENDPOINT_URL: ${MLFLOW_S3_ENDPOINT_URL}
+      BUCKET: mlflow-artefact-store
+      AWS_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY}
+      POSTGRES_URL: postgresql+psycopg2://postgres:${PG_PASS}@postgres-mlflow:5432/mlflow
+    networks:
+      - mlsdo
+
+  postgres-mlflow:
+    image: postgres:latest
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${PG_PASS}
+      POSTGRES_DB: mlflow
+    ports:
+      - "5433:5432" # Note the non-default port
+    volumes:
+      - ./volumes/postgres-mlflow_data:/var/lib/postgresql
+    networks:
+      - mlsdo
+
+  minio-mlflow:
+    build: ./data/training/minio
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD} # Min password length is 8
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ./data/training/volumes/minio-mlflow_data:/data
+      - ./data/training/minio/policies:/policies
+    networks:
+      - mlsdo
+
+  mongo-express:
+    image: mongo-express:latest
+    ports:
+      - "8081:8081"
+    environment:
+      ME_CONFIG_MONGODB_SERVER: mongodb
+      ME_CONFIG_MONGODB_PORT: 27017
+      ME_CONFIG_BASICAUTH_USERNAME: admin
+      ME_CONFIG_BASICAUTH_PASSWORD: ${MONGO_PASS}
+    depends_on:
+      - mongodb
+    networks:
+      - mlsdo
+
+  # --- OBSERVABILITY & MONITORING ---
+  prometheus:
+    image: prom/prometheus
+    user: root
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./volumes/prometheus-data:/prometheus
+    networks:
+      - mlsdo
+
+  grafana:
+    image: grafana/grafana-oss
+    user: root
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASS}
+      GF_SECURITY_CSRF_TRUSTED_ORIGINS: mlops.digital-lab.dev
+    volumes:
+      - ./grafana:/etc/grafana/provisioning/datasources
+      - ./volumes/grafana-data:/var/lib/grafana
+    networks:
+      - mlsdo
+
+  loki:
+    image: grafana/loki:latest
+    user: root
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./volumes/loki-data:/loki
+      #- ./loki/loki-config.yaml:/etc/loki/local-config.yaml
+    networks:
+      - mlsdo
+
+  redis:
+    image: "redis:alpine"
+    ports:
+      - "6379:6379"
+    networks:
+      - mlsdo
+
+  worker:
+    build: ./backend/api
+    command: celery -A worker worker --loglevel=info --concurrency=4
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=${REDIS_URL}
+      - LOKI_ENDPOINT=${LOKI_ENDPOINT}
+      - MLFLOW_TRACKING_URI=${MLFLOW_TRACKING_URI}
+      - MLFLOW_S3_ENDPOINT_URL=${MLFLOW_S3_ENDPOINT_URL}
+      - AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_KEY}
+      - MONGO_URI=${MONGO_URI}
+    networks:
+      - mlsdo
+
+networks:
+  mlsdo:
+    driver: bridge
+    name: mlsdo
+    external: true

@@ -1,0 +1,256 @@
+# =============================================================================
+# CI/CD Pipeline (Remote-VM deploy model)
+#
+# This pipeline builds images in GitLab CI, then deploys and runs everything on a
+# long-lived VM. The VM pulls images from the GitLab registry and keeps
+# state (databases, MinIO, etc.) in host volumes under /home/$VM_USER/app/volumes.
+# =============================================================================
+variables:
+  VM_USER: warpgate
+
+image: finalgene/openssh
+
+stages:
+  - quality
+  - build
+  - setup
+  - fetchdata
+  - processdata
+  - training
+  - deploy
+
+# =============================================================================
+# STAGE: quality
+# Design choices:
+# - Keep quality separate from build/deploy so failures are isolated and fast.
+# - Running pylint first avoids wasting build time on bad code.
+# - Use rules:changes so we lint only when Python changes.
+# =============================================================================
+lintcode:
+  stage: quality
+  image: python:3.9-slim
+  before_script:
+    - pip install pylint fastapi pydantic mlflow pandas scikit-learn pymongo pandas
+  script:
+    - pylint --fail-under=5.0 backend/api data/processing data/training
+  rules:
+    - changes:
+        - "**/*.py"
+
+# =============================================================================
+# STAGE: build
+# Design choices:
+# - Build images in CI (Docker-in-Docker) and push to registry; VM only pulls.
+# - Separate backend/frontend builds and trigger them only on relevant changes.
+# =============================================================================
+build-backend:
+  stage: build
+  image: docker:20.10.16
+  services:
+    - docker:20.10.16-dind
+  before_script:
+    - echo $CI_REGISTRY_PASSWORD | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
+  script:
+    - cd backend/api
+    - docker build --no-cache -t $CI_REGISTRY_IMAGE:backend-latest .
+    - docker push $CI_REGISTRY_IMAGE:backend-latest
+  only:
+    changes:
+      - backend/**/*
+
+build-frontend:
+  stage: build
+  image: docker:20.10.16
+  services:
+    - docker:20.10.16-dind
+  before_script:
+    - echo $CI_REGISTRY_PASSWORD | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
+  script:
+    - cd frontend
+    - echo $CI_WARPGATE_URL
+    - docker build --no-cache --build-arg NEXT_PUBLIC_API_BASE_URL=$CI_WARPGATE_URL -t $CI_REGISTRY_IMAGE:frontend-latest .
+    - docker push $CI_REGISTRY_IMAGE:frontend-latest
+  only:
+    changes:
+      - frontend/**/*
+
+# =============================================================================
+# STAGE: setup
+# Design choices:
+# - VM is the runtime: we rsync repo to /home/$VM_USER/app.
+# - rsync uses --delete; therefore we exclude volumes/ and .env to preserve state
+#   and avoid accidentally deleting secrets/config.
+# - docker-compose.override.yml is excluded to prevent local-dev overrides on VM.
+# - For stateful services, passwords can “stick” in volumes; we run update commands
+#   opportunistically (non-fatal if service not up yet).
+# =============================================================================
+setupinfra:
+  stage: setup
+  script:
+    - which rsync || apk add --update rsync
+    - ssh $CI_SSH_HOST "sudo mkdir -p /home/$VM_USER/app && sudo chown $VM_USER:$VM_USER /home/$VM_USER/app"
+    # Create .env on the VM
+    - |
+      ssh $CI_SSH_HOST "cat > /home/$VM_USER/app/.env" << EOF
+      MINIO_ROOT_PASSWORD=$MINIO_ROOT_PASSWORD
+      MINIO_ACCESS_KEY=$MINIO_ACCESS_KEY
+      MINIO_SECRET_KEY=$MINIO_SECRET_KEY
+      MLFLOW_PASS=$MLFLOW_PASS
+      MONGO_PASS=$MONGO_PASS
+      PG_PASS=$PG_PASS
+      GRAFANA_PASS=$GRAFANA_PASS
+      REDIS_URL=redis://redis:6379/0
+      MLFLOW_TRACKING_URI=http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL=http://minio-mlflow:9000
+      MONGO_URI=mongodb://mongodb:27017
+      LOKI_ENDPOINT=http://loki:3100/loki/api/v1/push
+      EOF
+
+    # Sync repo to VM excludeing volumes/, .env, and docker-compose.override.yml
+    - rsync -rtvz --delete --exclude 'volumes' --exclude .env --exclude 'docker-compose.override.yml' . $CI_SSH_HOST:/home/$VM_USER/app
+    - ssh $CI_SSH_HOST "echo $CI_REGISTRY_PASSWORD | sudo docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin"
+
+    # Update passwords in stateful services if they have changed
+    - ssh $CI_SSH_HOST "sudo docker compose -f /home/$VM_USER/app/docker-compose.yml exec -T postgres-mlflow psql -U postgres -c \"ALTER USER postgres WITH PASSWORD '${PG_PASS}';\" || echo 'Postgres not running yet'"
+    - ssh $CI_SSH_HOST "sudo docker compose -f /home/$VM_USER/app/docker-compose.yml exec -T grafana grafana cli admin reset-admin-password ${GRAFANA_PASS} || echo 'Grafana not running yet'"
+    - ssh $CI_SSH_HOST "sudo docker compose -f /home/$VM_USER/app/docker-compose.yml exec -T mongodb mongosh admin -u root -p '${MONGO_PASS_OLD}' --eval \"db.changeUserPassword('root', '${MONGO_PASS}')\" || echo 'MongoDB not running yet'"
+    - ssh $CI_SSH_HOST "cd /home/$VM_USER/app && sudo docker compose down && sudo docker compose -f docker-compose.yml up -d"
+    - ssh $CI_SSH_HOST "sleep 10"
+
+    # Setup MinIO users/policies/buckets for MLflow
+    - ssh $CI_SSH_HOST "sudo docker compose -f /home/$VM_USER/app/docker-compose.yml exec minio-mlflow mc alias set local http://minio-mlflow:9000 minio $MINIO_ROOT_PASSWORD"
+    - ssh $CI_SSH_HOST "sudo docker compose -f /home/$VM_USER/app/docker-compose.yml exec minio-mlflow mc admin policy create local mlflow-base /policies/mlflow-base-access.json || true"
+    - ssh $CI_SSH_HOST "sudo docker compose -f /home/$VM_USER/app/docker-compose.yml exec minio-mlflow mc admin user add local mlflow $MLFLOW_PASS || true"
+    - ssh $CI_SSH_HOST "sudo docker compose -f /home/$VM_USER/app/docker-compose.yml exec minio-mlflow mc admin policy attach local mlflow-base --user mlflow"
+    - ssh $CI_SSH_HOST "sudo docker compose -f /home/$VM_USER/app/docker-compose.yml exec minio-mlflow mc admin user svcacct add local mlflow --policy /policies/mlflow-store-access.json --access-key '$MINIO_ACCESS_KEY' --secret-key '$MINIO_SECRET_KEY' || true"
+    - ssh $CI_SSH_HOST "sudo docker compose -f /home/$VM_USER/app/docker-compose.yml exec minio-mlflow mc mb --ignore-existing local/mlflow-artefact-store"
+
+# Pull latest backend image
+.update_backend_image:
+  before_script:
+    - ssh $CI_SSH_HOST "sudo docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY"
+    - ssh $CI_SSH_HOST "sudo docker pull $CI_REGISTRY_IMAGE:backend-latest"
+
+# Pull latest frontend image
+.update_frontend_image:
+  before_script:
+    - ssh $CI_SSH_HOST "sudo docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY"
+    - ssh $CI_SSH_HOST "sudo docker pull $CI_REGISTRY_IMAGE:frontend-latest"
+
+# =============================================================================
+# STAGE: fetchdata
+# Design choices:
+# - Data is pulled to the VM (DVC) then restored into Mongo service container.
+# - allow_failure is enabled to avoid blocking the pipeline on flaky data steps.
+# =============================================================================
+fetchdata:
+  stage: fetchdata
+  before_script:
+    - !reference [.update_backend_image, before_script]
+  allow_failure: true
+  script:
+    - ssh $CI_SSH_HOST "sudo docker stop ppl-updatedata || true && sudo docker rm ppl-updatedata || true"
+    - ssh $CI_SSH_HOST "cd /home/$VM_USER/app && dvc pull"
+
+    # Restore MongoDB from DVC-fetched dumps
+    - ssh $CI_SSH_HOST "sudo docker compose -f /home/$VM_USER/app/docker-compose.yml exec -T mongodb sh -c '
+      mongorestore --gzip --archive=/data/raw/mongodump-JiraRepos_2023-03-07-16_00.archive --nsFrom=\"JiraRepos.*\" --nsTo=\"JiraRepos.*\" &&
+      mongorestore --gzip --archive=/data/raw/mongodump-MiningDesignDecisions-lite.archive --nsFrom=\"MiningDesignDecisions.*\" --nsTo=\"MiningDesignDecisions.*\"'"
+    - ssh $CI_SSH_HOST "sleep 10"
+
+    # Run ADD database creation script for keyword search
+    - ssh $CI_SSH_HOST "sudo docker stop create-add-db || true && sudo docker rm create-add-db || true"
+    - ssh $CI_SSH_HOST "sudo docker run
+      --name create-add-db
+      --network mlsdo
+      --env-file /home/$VM_USER/app/.env
+      -v /home/$VM_USER/app/data:/app/data
+      $CI_REGISTRY_IMAGE:backend-latest python /app/data/processing/process_ADD_db.py"
+  rules:
+    - changes:
+        - dvc.lock
+        - "**/*.dvc"
+
+# =============================================================================
+# STAGE: processdata
+# Design choices:
+# - ETL runs in an ephemeral container using the backend image for consistency.
+# - Named container is removed first to keep reruns idempotent.
+# =============================================================================
+processdata:
+  stage: processdata
+  before_script:
+    - !reference [.update_backend_image, before_script]
+  script:
+    - ssh $CI_SSH_HOST "sudo docker stop ppl-processdata || true && sudo docker rm ppl-processdata || true"
+    - ssh $CI_SSH_HOST "sudo docker run
+      --name ppl-processdata
+      --network mlsdo
+      --env-file /home/$VM_USER/app/.env
+      -v /home/$VM_USER/app/data:/app/data
+      $CI_REGISTRY_IMAGE:backend-latest python /app/data/processing/etl_pipeline.py"
+  rules:
+    - changes:
+        - data/**/*
+        - dvc.lock
+        - "**/*.dvc"
+
+# =============================================================================
+# STAGE: training
+# Design choices:
+# - Training mirrors ETL: ephemeral container + VM-mounted data.
+# =============================================================================
+trainmodel:
+  stage: training
+  before_script:
+    - !reference [.update_backend_image, before_script]
+  script:
+    - ssh $CI_SSH_HOST "sudo docker stop ppl-train || true && sudo docker rm ppl-train || true"
+    - ssh $CI_SSH_HOST "sudo docker run
+      --name ppl-train
+      --network mlsdo
+      --env-file /home/$VM_USER/app/.env
+      -v /home/$VM_USER/app/data:/app/data
+      $CI_REGISTRY_IMAGE:backend-latest python /app/data/training/train_model.py"
+  rules:
+    - changes:
+        - data/**/*
+        - dvc.lock
+        - "**/*.dvc"
+
+# =============================================================================
+# STAGE: deploy
+# Design choices:
+# - Deploy API/frontend as long-running containers (restart policy enabled).
+# =============================================================================
+deployapi:
+  stage: deploy
+  before_script:
+    - !reference [.update_backend_image, before_script]
+  script:
+    - ssh $CI_SSH_HOST "sudo docker stop api || true && sudo docker rm api || true"
+    - ssh $CI_SSH_HOST "sudo docker run -d
+      --name api
+      --network mlsdo
+      --restart unless-stopped
+      -p 8080:8000
+      --env-file /home/$VM_USER/app/.env
+      $CI_REGISTRY_IMAGE:backend-latest"
+  rules:
+    - changes:
+        - backend/**/*
+
+deployfrontend:
+  stage: deploy
+  before_script:
+    - !reference [.update_frontend_image, before_script]
+  script:
+    - ssh $CI_SSH_HOST "sudo docker stop frontend || true && sudo docker rm frontend || true"
+    - ssh $CI_SSH_HOST "sudo docker run -d
+      --name frontend
+      --network mlsdo
+      -p 80:3000
+      $CI_REGISTRY_IMAGE:frontend-latest"
+  rules:
+    - changes:
+        - frontend/**/*
