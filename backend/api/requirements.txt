@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+mlflow
+scikit-learn
+boto3
+psycopg2-binary
+pandas
+pandera
+pymongo
+prometheus-fastapi-instrumentator
+python-logging-loki
+datasets
+pydantic
+requests
+celery[redis]

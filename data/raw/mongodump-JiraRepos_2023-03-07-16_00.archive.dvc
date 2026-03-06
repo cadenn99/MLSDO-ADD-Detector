@@ -1,0 +1,6 @@
+outs:
+- md5: 177203dcd2da07e2f464de9adbf77e49
+  size: 7502732161
+  isexec: true
+  hash: md5
+  path: mongodump-JiraRepos_2023-03-07-16_00.archive

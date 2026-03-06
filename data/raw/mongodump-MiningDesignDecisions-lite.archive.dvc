@@ -1,0 +1,6 @@
+outs:
+- md5: 273d40740b7b42641da66f2b317284c6
+  size: 2756900371
+  isexec: true
+  hash: md5
+  path: mongodump-MiningDesignDecisions-lite.archive

@@ -4,3 +4,4 @@ data/processing/dataset_cleaned.parquet
 data/training/mlflow-lab/volumes/
 volumes/
 .env
+.dvc/
